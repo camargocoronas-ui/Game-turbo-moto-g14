@@ -1,0 +1,390 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Criar projeto
+        run: |
+          mkdir -p GameTurbo/app
+          cat > GameTurbo/app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.gameturbo"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.gameturbo"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              buildTypes { release { isMinifyEnabled = false } }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+          mkdir -p GameTurbo/app/src/main
+          cat > GameTurbo/app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.WRITE_SETTINGS" />
+              <uses-permission android:name="android.permission.KILL_BACKGROUND_PROCESSES" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.ACCESS_NOTIFICATION_POLICY" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+              </queries>
+
+              <application android:label="Game Turbo" android:theme="@android:style/Theme.Material.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".TurboTile" android:exported="true"
+                      android:label="Game Turbo" android:icon="@android:drawable/ic_media_play"
+                      android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+                      <intent-filter><action android:name="android.service.quicksettings.action.QS_TILE" /></intent-filter>
+                  </service>
+                  <service android:name=".TurboService" android:exported="false"
+                      android:foregroundServiceType="specialUse">
+                      <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="game_performance_overlay" />
+                  </service>
+              </application>
+          </manifest>
+          EOF
+          mkdir -p GameTurbo/app/src/main/java/com/gameturbo
+          cat > GameTurbo/app/src/main/java/com/gameturbo/Cleaner.kt <<'EOF'
+          package com.gameturbo
+
+          import android.app.ActivityManager
+          import android.content.Context
+          import android.os.Build
+          import android.os.StatFs
+          import android.os.storage.StorageManager
+          import java.io.File
+          import java.io.FileOutputStream
+
+          object Cleaner {
+              fun freeRamMb(c: Context): Long {
+                  val am = c.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+                  return ActivityManager.MemoryInfo().also { am.getMemoryInfo(it) }.availMem / 1048576
+              }
+
+              /** Mata processos em cache de todos os apps (menos este e o jogo). */
+              fun cleanRam(c: Context, keep: String?) {
+                  val am = c.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+                  c.packageManager.getInstalledApplications(0).forEach {
+                      if (it.packageName != c.packageName && it.packageName != keep) am.killBackgroundProcesses(it.packageName)
+                  }
+              }
+
+              /** Limpa cache próprio e pede ao sistema para apagar cache de outros apps. Retorna MB liberados. Rodar fora da thread principal. */
+              fun cleanStorage(c: Context): Long {
+                  val before = StatFs(c.filesDir.path).availableBytes
+                  c.cacheDir.deleteRecursively(); c.externalCacheDir?.deleteRecursively()
+                  if (Build.VERSION.SDK_INT >= 26) runCatching {
+                      val sm = c.getSystemService(StorageManager::class.java)
+                      val bytes = sm.getAllocatableBytes(sm.getUuidForPath(c.filesDir))
+                      val f = File(c.filesDir, "turbo.tmp")
+                      FileOutputStream(f).use { sm.allocateBytes(it.fd, bytes) }
+                      f.delete()
+                  }
+                  File(c.filesDir, "turbo.tmp").delete()
+                  val after = StatFs(c.filesDir.path).availableBytes
+                  return maxOf(0L, (after - before) / 1048576)
+              }
+
+              /** Procura o Gametime/Modo Jogo nativo da Motorola entre os apps instalados. */
+              fun gametimePackage(c: Context): String? {
+                  val pm = c.packageManager
+                  val i = android.content.Intent(android.content.Intent.ACTION_MAIN).addCategory(android.content.Intent.CATEGORY_LAUNCHER)
+                  return pm.queryIntentActivities(i, 0).firstOrNull {
+                      val p = it.activityInfo.packageName.lowercase(); val l = it.loadLabel(pm).toString().lowercase()
+                      p.startsWith("com.motorola") && (p.contains("game") || l.contains("game"))
+                  }?.activityInfo?.packageName
+              }
+          }
+          EOF
+          mkdir -p GameTurbo/app/src/main/java/com/gameturbo
+          cat > GameTurbo/app/src/main/java/com/gameturbo/MainActivity.kt <<'EOF'
+          package com.gameturbo
+
+          import android.Manifest
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.app.NotificationManager
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.Color
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+              private lateinit var status: TextView
+              private val prefs by lazy { getSharedPreferences("turbo", MODE_PRIVATE) }
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(48, 96, 48, 48)
+                      setBackgroundColor(Color.parseColor("#0D0D12"))
+                      gravity = Gravity.CENTER_HORIZONTAL
+                  }
+                  val title = TextView(this).apply {
+                      text = "⚡ GAME TURBO"; textSize = 30f
+                      setTextColor(Color.parseColor("#00E676")); gravity = Gravity.CENTER
+                  }
+                  status = TextView(this).apply {
+                      textSize = 15f; setTextColor(Color.WHITE); setPadding(0, 32, 0, 32)
+                  }
+                  root.addView(title); root.addView(status)
+                  fun btn(t: String, a: () -> Unit) = Button(this).apply {
+                      text = t; setOnClickListener { a() }
+                  }.also { root.addView(it) }
+                  btn("1) Dar permissões") { askPermissions() }
+                  btn("2) Escolher jogo") { pickGame() }
+                  btn("3) 🚀 LIGAR TURBO E ABRIR JOGO") { turboOn() }
+                  btn("🧹 Limpar RAM agora") { cleanRamNow() }
+                  btn("🗑 Limpar armazenamento (cache)") { cleanStorageNow() }
+                  btn("🎮 Abrir Gametime nativo da Motorola") { openGametime() }
+                  btn("Desligar turbo") { stopService(Intent(this, TurboService::class.java)); toast("Turbo desligado") }
+                  setContentView(root)
+              }
+
+              override fun onResume() { super.onResume(); refresh() }
+
+              private fun hasDnd() = (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).isNotificationPolicyAccessGranted
+              private fun refresh() {
+                  val game = prefs.getString("game", null)
+                  val name = game?.let { runCatching { packageManager.getApplicationLabel(packageManager.getApplicationInfo(it, 0)) }.getOrNull() } ?: "nenhum"
+                  status.text = """
+                      Sobreposição: ${if (Settings.canDrawOverlays(this)) "✅" else "❌"}
+                      Modificar configurações: ${if (Settings.System.canWrite(this)) "✅" else "❌"}
+                      Não Perturbe: ${if (hasDnd()) "✅" else "❌"}
+                      Jogo: $name
+                  """.trimIndent()
+              }
+
+              private fun askPermissions() {
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                  when {
+                      !Settings.canDrawOverlays(this) -> startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                      !Settings.System.canWrite(this) -> startActivity(Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS, Uri.parse("package:$packageName")))
+                      !hasDnd() -> startActivity(Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS))
+                      else -> toast("Tudo liberado!")
+                  }
+              }
+
+              private fun pickGame() {
+                  val pm = packageManager
+                  val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                  val apps = pm.queryIntentActivities(intent, 0)
+                      .map { it.activityInfo.packageName to it.loadLabel(pm).toString() }
+                      .filter { it.first != packageName }.distinctBy { it.first }.sortedBy { it.second.lowercase() }
+                  AlertDialog.Builder(this).setTitle("Escolha o jogo")
+                      .setItems(apps.map { it.second }.toTypedArray()) { _, i ->
+                          prefs.edit().putString("game", apps[i].first).apply(); refresh()
+                      }.show()
+              }
+
+              private fun turboOn() {
+                  if (!Settings.canDrawOverlays(this)) { askPermissions(); return }
+                  val game = prefs.getString("game", null) ?: run { toast("Escolha um jogo primeiro"); return }
+                  val svc = Intent(this, TurboService::class.java).putExtra("game", game)
+                  startForegroundService(svc)
+                  packageManager.getLaunchIntentForPackage(game)?.let { startActivity(it) }
+              }
+
+              private fun cleanRamNow() {
+                  val before = Cleaner.freeRamMb(this)
+                  Cleaner.cleanRam(this, prefs.getString("game", null))
+                  status.postDelayed({ toast("RAM livre: $before → ${Cleaner.freeRamMb(this)} MB"); refresh() }, 1000)
+              }
+
+              private fun cleanStorageNow() {
+                  toast("Limpando… pode levar alguns segundos")
+                  Thread {
+                      val mb = Cleaner.cleanStorage(this)
+                      runOnUiThread { toast("Liberado: $mb MB de cache") }
+                  }.start()
+              }
+
+              private fun openGametime() {
+                  val pkg = Cleaner.gametimePackage(this)
+                  val i = pkg?.let { packageManager.getLaunchIntentForPackage(it) }
+                  if (i != null) startActivity(i) else toast("Gametime não encontrado neste aparelho")
+              }
+
+              private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
+          }
+          EOF
+          mkdir -p GameTurbo/app/src/main/java/com/gameturbo
+          cat > GameTurbo/app/src/main/java/com/gameturbo/TurboService.kt <<'EOF'
+          package com.gameturbo
+
+          import android.app.*
+          import android.content.Context
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.os.BatteryManager
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.os.PowerManager
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.view.WindowManager
+          import android.widget.TextView
+
+          class TurboService : Service() {
+              private var overlay: TextView? = null
+              private var wl: PowerManager.WakeLock? = null
+              private val handler = Handler(Looper.getMainLooper())
+              private var oldFilter = NotificationManager.INTERRUPTION_FILTER_ALL
+              private var oldBrightMode = 1
+              private var oldBright = 128
+              private var dndChanged = false
+
+              private val tick = object : Runnable {
+                  override fun run() {
+                      val am = getSystemService(ACTIVITY_SERVICE) as ActivityManager
+                      val mi = ActivityManager.MemoryInfo().also { am.getMemoryInfo(it) }
+                      val bat = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                      val temp = (bat?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) ?: 0) / 10f
+                      val level = bat?.getIntExtra(BatteryManager.EXTRA_LEVEL, 0) ?: 0
+                      overlay?.text = "RAM livre: ${mi.availMem / 1048576} MB\nTemp: $temp°C  Bat: $level%"
+                      overlay?.setTextColor(if (temp >= 42f) Color.RED else Color.parseColor("#00E676"))
+                      handler.postDelayed(this, 1500)
+                  }
+              }
+
+              override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
+                  running = true
+                  val game = i?.getStringExtra("game")
+                  startForeground(1, notif())
+                  cleanRam(game)
+                  applySystem()
+                  showOverlay()
+                  handler.post(tick)
+                  return START_NOT_STICKY
+              }
+
+              private fun notif(): Notification {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("turbo", "Game Turbo", NotificationManager.IMPORTANCE_LOW))
+                  return Notification.Builder(this, "turbo")
+                      .setContentTitle("Game Turbo ativo").setSmallIcon(android.R.drawable.ic_media_play)
+                      .setOngoing(true).build()
+              }
+
+              private fun cleanRam(game: String?) = Cleaner.cleanRam(this, game)
+
+              private fun applySystem() {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  if (nm.isNotificationPolicyAccessGranted) {
+                      oldFilter = nm.currentInterruptionFilter
+                      nm.setInterruptionFilter(NotificationManager.INTERRUPTION_FILTER_NONE)
+                      dndChanged = true
+                  }
+                  if (Settings.System.canWrite(this)) {
+                      val cr = contentResolver
+                      oldBrightMode = Settings.System.getInt(cr, Settings.System.SCREEN_BRIGHTNESS_MODE, 1)
+                      oldBright = Settings.System.getInt(cr, Settings.System.SCREEN_BRIGHTNESS, 128)
+                      // trava brilho manual para o sistema não ficar variando durante o jogo
+                      Settings.System.putInt(cr, Settings.System.SCREEN_BRIGHTNESS_MODE, 0)
+                      Settings.System.putInt(cr, Settings.System.SCREEN_BRIGHTNESS, oldBright)
+                  }
+                  wl = (getSystemService(POWER_SERVICE) as PowerManager)
+                      .newWakeLock(PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ON_AFTER_RELEASE, "gameturbo:wl")
+                      .also { it.acquire(4 * 60 * 60 * 1000L) }
+              }
+
+              private fun showOverlay() {
+                  if (!Settings.canDrawOverlays(this)) return
+                  val tv = TextView(this).apply {
+                      textSize = 11f; setPadding(16, 8, 16, 8)
+                      setBackgroundColor(Color.parseColor("#99000000"))
+                  }
+                  val lp = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                          WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
+                      PixelFormat.TRANSLUCENT
+                  ).apply { gravity = Gravity.TOP or Gravity.START; x = 8; y = 8 }
+                  (getSystemService(WINDOW_SERVICE) as WindowManager).addView(tv, lp)
+                  overlay = tv
+              }
+
+              override fun onDestroy() {
+                  running = false
+                  handler.removeCallbacks(tick)
+                  overlay?.let { (getSystemService(WINDOW_SERVICE) as WindowManager).removeView(it) }
+                  wl?.takeIf { it.isHeld }?.release()
+                  if (dndChanged) getSystemService(NotificationManager::class.java).setInterruptionFilter(oldFilter)
+                  if (Settings.System.canWrite(this)) {
+                      Settings.System.putInt(contentResolver, Settings.System.SCREEN_BRIGHTNESS_MODE, oldBrightMode)
+                  }
+                  super.onDestroy()
+              }
+
+              companion object { @Volatile var running = false }
+
+              override fun onBind(i: Intent?): IBinder? = null
+          }
+          EOF
+          mkdir -p GameTurbo/app/src/main/java/com/gameturbo
+          cat > GameTurbo/app/src/main/java/com/gameturbo/TurboTile.kt <<'EOF'
+          package com.gameturbo
+
+          import android.content.Intent
+          import android.service.quicksettings.Tile
+          import android.service.quicksettings.TileService
+
+          class TurboTile : TileService() {
+              override fun onStartListening() = update()
+              override fun onClick() {
+                  if (TurboService.running) stopService(Intent(this, TurboService::class.java))
+                  else {
+                      val game = getSharedPreferenc
