@@ -377,6 +377,7 @@ jobs:
           mkdir -p GameTurbo/app/src/main/java/com/gameturbo
           cat > GameTurbo/app/src/main/java/com/gameturbo/TurboTile.kt <<'EOF'
           package com.gameturbo
+          package com.gameturbo
 
           import android.content.Intent
           import android.service.quicksettings.Tile
@@ -388,3 +389,50 @@ jobs:
                   if (TurboService.running) stopService(Intent(this, TurboService::class.java))
                   else {
                       val game = getSharedPreferenc
+          # fim do trecho cortado
+          EOF
+          cat > GameTurbo/app/src/main/java/com/gameturbo/TurboTile.kt <<'EOF'
+          package com.gameturbo
+
+          import android.content.Intent
+          import android.service.quicksettings.Tile
+          import android.service.quicksettings.TileService
+
+          class TurboTile : TileService() {
+              override fun onStartListening() = update()
+              override fun onClick() {
+                  if (TurboService.running) stopService(Intent(this, TurboService::class.java))
+                  else {
+                      val game = getSharedPreferences("turbo", MODE_PRIVATE).getString("game", null)
+                      startForegroundService(Intent(this, TurboService::class.java).putExtra("game", game))
+                  }
+                  TurboService.running = !TurboService.running
+                  update()
+              }
+              private fun update() {
+                  qsTile?.apply { state = if (TurboService.running) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE; label = "Game Turbo"; updateTile() }
+              }
+          }
+          EOF
+          mkdir -p GameTurbo
+          cat > GameTurbo/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > GameTurbo/gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=true
+          EOF
+          cat > GameTurbo/settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "GameTurbo"
+          include(":app")
+          EOF
+      - run: cd GameTurbo && gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GameTurbo-APK
+          path: GameTurbo/app/build/outputs/apk/debug/app-debug.apk
