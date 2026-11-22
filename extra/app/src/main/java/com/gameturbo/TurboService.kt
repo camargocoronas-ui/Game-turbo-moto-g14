@@ -119,16 +119,16 @@ class TurboService : Service() {
         p.setPadding(pad, pad, pad, pad)
         p.background = round(Color.parseColor("#EE12121A"), 24 * dp)
         p.setOnTouchListener { _, e -> if (e.action == MotionEvent.ACTION_OUTSIDE) closePanel(); false }
-        fun row(a: TextView, b: TextView) {
+        fun row(a: TextView, b: TextView? = null) {
             val r = LinearLayout(this)
             r.orientation = LinearLayout.HORIZONTAL
-            r.addView(a); r.addView(b)
+            r.addView(a); if (b != null) r.addView(b)
             p.addView(r)
         }
         row(tile("turbo", "⚡ Turbo total") { turboTotal() }, tile("dnd", "🔕 Não Perturbe") { toggleDnd() })
         row(tile("ram", "🧹 Limpar RAM") { cleanRamNow() }, tile("cache", "🗑 Limpar cache") { cleanCacheNow() })
         row(tile("bright", "🔒 Travar brilho") { toggleBright() }, tile("auto", "🔁 Limpeza auto") { toggleAuto() })
-        row(tile("gt", "🎮 Gametime") { openGametime() }, tile("close", "✖ Fechar turbo") { stopSelf() })
+        row(tile("close", "✖ Fechar turbo") { stopSelf() })
         panel = p
     }
 
@@ -193,11 +193,6 @@ class TurboService : Service() {
             val mb = Cleaner.cleanStorage(this)
             h.post { toast("Liberado: $mb MB de cache") }
         }.start()
-    }
-
-    private fun openGametime() {
-        val i = Cleaner.gametimePackage(this)?.let { packageManager.getLaunchIntentForPackage(it) }
-        if (i != null) startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) else toast("Gametime não encontrado")
     }
 
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
