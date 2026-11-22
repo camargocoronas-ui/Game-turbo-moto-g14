@@ -431,7 +431,7 @@ jobs:
           rootProject.name = "GameTurbo"
           include(":app")
           EOF
-      - run: cd GameTurbo && gradle assembleDebug
+      - run: cp -r extra/. GameTurbo/ && sed -i '/Abrir Gametime/d' GameTurbo/app/src/main/java/com/gameturbo/MainActivity.kt && cd GameTurbo && gradle assembleDebug
       - uses: actions/upload-artifact@v4
         with:
           name: GameTurbo-APK
